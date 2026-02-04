@@ -396,6 +396,7 @@ static inline mode_t file_attr_to_st_mode(DWORD attr)
 
 static int get_file_attr(const char *fname, WIN32_FILE_ATTRIBUTE_DATA *fdata)
 {
+	wchar_t wpath[32768];
 	char *want_dir;
 	int dev = get_dev_type(fname);
 
@@ -412,7 +413,13 @@ static int get_file_attr(const char *fname, WIN32_FILE_ATTRIBUTE_DATA *fdata)
 	}
 
 	want_dir = last_char_is_dir_sep(fname);
-	if (GetFileAttributesExA(fname, GetFileExInfoStandard, fdata)) {
+
+	/* Convert to wide string for long path support.  CP_ACP is CP_UTF8
+	 * when the UTF-8 manifest is active, else the system ANSI code page. */
+	if (MultiByteToWideChar(CP_ACP, 0, fname, -1, wpath, 32768) == 0)
+		return EINVAL;
+
+	if (GetFileAttributesExW(wpath, GetFileExInfoStandard, fdata)) {
 		if (!(fdata->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && want_dir)
 			return ENOTDIR;
 		fdata->dwFileAttributes &= ~FILE_ATTRIBUTE_DEVICE;
@@ -421,9 +428,9 @@ static int get_file_attr(const char *fname, WIN32_FILE_ATTRIBUTE_DATA *fdata)
 
 	if (GetLastError() == ERROR_SHARING_VIOLATION) {
 		HANDLE hnd;
-		WIN32_FIND_DATA fd;
+		WIN32_FIND_DATAW fd;
 
-		if ((hnd=FindFirstFile(fname, &fd)) != INVALID_HANDLE_VALUE) {
+		if ((hnd=FindFirstFileW(wpath, &fd)) != INVALID_HANDLE_VALUE) {
 			fdata->dwFileAttributes =
 					fd.dwFileAttributes & ~FILE_ATTRIBUTE_DEVICE;
 			fdata->ftCreationTime = fd.ftCreationTime;
@@ -1889,20 +1896,31 @@ int fcntl(int fd, int cmd, ...)
 #undef rmdir
 int mingw_unlink(const char *pathname)
 {
-	int ret;
+	wchar_t wpath[32768];
 
 	/* read-only files cannot be removed */
 	chmod(pathname, 0666);
 
-	ret = unlink(pathname);
-	if (ret == -1 && errno == EACCES) {
+	/* convert to wide string for long path support */
+	if (MultiByteToWideChar(CP_ACP, 0, pathname, -1, wpath, 32768) == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (DeleteFileW(wpath))
+		return 0;
+
+	if (GetLastError() == ERROR_ACCESS_DENIED) {
 		/* a symlink to a directory needs to be removed by calling rmdir */
-		/* (the *real* Windows rmdir, not mingw_rmdir) */
+		/* (the *real* Windows RemoveDirectoryW, not mingw_rmdir) */
 		if (is_symlink(pathname)) {
-			return rmdir(pathname);
+			if (RemoveDirectoryW(wpath))
+				return 0;
 		}
 	}
-	return ret;
+
+	errno = err_win_to_posix();
+	return -1;
 }
 
 struct pagefile_info {
@@ -2074,6 +2092,8 @@ int mingw_access(const char *name, int mode)
 
 int mingw_rmdir(const char *path)
 {
+	wchar_t wpath[32768];
+
 	/* On Linux rmdir(2) doesn't remove symlinks */
 	if (is_symlink(path)) {
 		errno = ENOTDIR;
@@ -2082,7 +2102,18 @@ int mingw_rmdir(const char *path)
 
 	/* read-only directories cannot be removed */
 	chmod(path, 0666);
-	return rmdir(path);
+
+	/* convert to wide string for long path support */
+	if (MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, 32768) == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (RemoveDirectoryW(wpath))
+		return 0;
+
+	errno = err_win_to_posix();
+	return -1;
 }
 
 void mingw_sync(void)
